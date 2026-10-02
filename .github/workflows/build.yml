@@ -103,6 +103,18 @@ jobs:
         run: |
           df -h
           echo "outdir=${{ steps.build_android.outputs.outdir || steps.build_linux.outputs.outdir || steps.build_mac.outputs.outdir || steps.build_windows.outputs.outdir }}" >> $GITHUB_OUTPUT
+      # Without this, the build output is only downloadable when the run came
+      # from a `zkool-v*` tag (the Create Release step below). Uploading it as
+      # an artifact as well means a plain "Run workflow" press is enough to
+      # get the installer, with no tag and no git client.
+      - name: Upload build for download
+        uses: actions/upload-artifact@v4
+        if: ${{ steps.collect.outputs.outdir != '' }}
+        with:
+          name: zkool-${{ matrix.target }}${{ matrix.arch && format('-{0}', matrix.arch) || '' }}
+          path: ${{ steps.collect.outputs.outdir }}/*
+          if-no-files-found: warn
+          retention-days: 14
       - name: Attest build provenance
         if: startsWith(github.ref_name, 'zkool-v')
         uses: actions/attest@v4
