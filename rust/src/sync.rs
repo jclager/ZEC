@@ -225,69 +225,100 @@ pub async fn synchronize_impl<S: Sink<SyncProgress> + Send + 'static>(
                 .iter()
                 .map(|(account, _)| *account)
                 .collect::<Vec<_>>();
-            transparent_sync(
-                &network,
-                &mut connection,
-                &mut client,
-                &account_ids,
-                start_height,
-                end_height,
-                transparent_limit,
-                tx_cancel.subscribe(),
-            )
-            .await?;
+            // Sync in windows instead of one shot over the whole range, so
+            // that each finished window is committed to `sync_heights`. A
+            // failure then costs one window instead of every block scanned
+            // since the birth height, and the next run RESUMES rather than
+            // restarting into the same failure. See `SYNC_WINDOW`.
+            let mut window_start = start_height;
+            while window_start <= end_height {
+                let window_end = end_height.min(
+                    window_start.saturating_add(SYNC_WINDOW.saturating_sub(1)),
+                );
+                debug!(
+                    "Sync window {}-{} (of {}-{})",
+                    window_start, window_end, start_height, end_height
+                );
 
-            // Over the mixnet, download blocks in small chunks so each
-            // GetBlockRange stream fits in one nym-rpc session; elsewhere a
-            // single stream for the whole range is cheaper.
-            let chunk_size = c.is_mixnet().then_some(MIXNET_SYNC_CHUNK);
-            shielded_sync(
-                &network,
-                &pool,
-                &mut client,
-                &accounts_to_sync,
-                start_height,
-                end_height,
-                actions_per_sync,
-                chunk_size,
-                tx_progress.clone(),
-                tx_cancel.subscribe(),
-            )
-            .await?;
+                transparent_sync(
+                    &network,
+                    &mut connection,
+                    &mut client,
+                    &account_ids,
+                    window_start,
+                    window_end,
+                    transparent_limit,
+                    tx_cancel.subscribe(),
+                )
+                .await?;
 
-            debug!("heights_without_time");
-            let heights_without_time =
-                get_heights_without_time(&mut connection, &account_ids, start_height, end_height)
-                    .await?;
-            for h in heights_without_time {
-                debug!("fetch block @{h}");
-                let block = client.block(&network, h).await?;
-                let time = block.time;
-                for account in &account_ids {
-                    sqlx::query("UPDATE transactions SET time = ? WHERE height = ? AND time = 0 AND account = ?")
-                    .bind(time)
-                    .bind(h)
-                    .bind(account)
-                    .execute(&mut *connection)
-                    .await?;
-                }
-                let block_header = BlockHeader {
-                    height: h,
-                    hash: block.hash,
-                    time: block.time,
-                };
-                for account in &account_ids {
-                    store_relevant_block_header(&mut connection, *account, &block_header).await?;
-                }
-            }
+                // Over the mixnet, download blocks in small chunks so each
+                // GetBlockRange stream fits in one nym-rpc session; elsewhere a
+                // single stream for the whole window is cheaper.
+                let chunk_size = c.is_mixnet().then_some(MIXNET_SYNC_CHUNK);
+                shielded_sync(
+                    &network,
+                    &pool,
+                    &mut client,
+                    &accounts_to_sync,
+                    window_start,
+                    window_end,
+                    actions_per_sync,
+                    chunk_size,
+                    tx_progress.clone(),
+                    tx_cancel.subscribe(),
+                )
+                .await?;
 
-            // Update our local map as well for the next iteration
-            for (account, _) in &accounts_to_sync {
-                account_heights.insert(*account, end_height);
-                if !noskip_details {
-                    crate::memo::fetch_tx_details(&network, &mut connection, &mut client, *account)
+                debug!("heights_without_time");
+                let heights_without_time = get_heights_without_time(
+                    &mut connection,
+                    &account_ids,
+                    window_start,
+                    window_end,
+                )
+                .await?;
+                for h in heights_without_time {
+                    debug!("fetch block @{h}");
+                    let block = client.block(&network, h).await?;
+                    let time = block.time;
+                    for account in &account_ids {
+                        sqlx::query("UPDATE transactions SET time = ? WHERE height = ? AND time = 0 AND account = ?")
+                        .bind(time)
+                        .bind(h)
+                        .bind(account)
+                        .execute(&mut *connection)
                         .await?;
+                    }
+                    let block_header = BlockHeader {
+                        height: h,
+                        hash: block.hash,
+                        time: block.time,
+                    };
+                    for account in &account_ids {
+                        store_relevant_block_header(&mut connection, *account, &block_header)
+                            .await?;
+                    }
                 }
+
+                // Update our local map as well for the next iteration
+                for (account, _) in &accounts_to_sync {
+                    account_heights.insert(*account, window_end);
+                    if !noskip_details {
+                        crate::memo::fetch_tx_details(
+                            &network,
+                            &mut connection,
+                            &mut client,
+                            *account,
+                        )
+                        .await?;
+                    }
+                }
+
+                if window_end == end_height {
+                    break;
+                }
+                window_start = window_end + 1;
             }
 
             debug!(
@@ -679,6 +710,21 @@ fn resolve_diversifier_index(
 /// one session's budget and commit progress between chunks, so a dropped
 /// session only costs the current chunk.
 pub const MIXNET_SYNC_CHUNK: u32 = 1000;
+
+/// Largest block range synced before progress is committed, on EVERY
+/// connection and not only over the mixnet.
+///
+/// The reasoning above for `MIXNET_SYNC_CHUNK` ("commit progress between
+/// chunks, so a dropped session only costs the current chunk") applies just
+/// as much to an ordinary connection, where the whole range from the account
+/// birth height to the chain tip used to be synced as ONE operation with
+/// `sync_heights` written only at the very end. A single failure in the
+/// middle - a dropped stream, a timeout, a heavy block - discarded every
+/// block already scanned, so the next attempt restarted from the birth
+/// height and died in the same place. The wallet then looked frozen at one
+/// date forever and showed only the balance of the part it had managed to
+/// scan before the first failure.
+pub const SYNC_WINDOW: u32 = 25_000;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn shielded_sync(
@@ -1306,6 +1352,37 @@ pub async fn transparent_sweep(
         let tk = select_account_transparent(&mut connection, account, dindex).await?;
         let xvk = tk.xvk;
         let start_height = get_birth_height(&mut connection, account).await?;
+
+        // An account imported from a single transparent secret key (a WIF, or
+        // a raw private key) has no extended key, so there is no derivation
+        // tree to walk and nothing to gap-scan: it owns exactly ONE address,
+        // which is already stored. The old code reached the catch-all below
+        // and failed with "Sweep needs an xpub key", which made the "Scan
+        // Transparent Addresses" button useless for exactly the accounts that
+        // most often need it. Scanning that one address is both correct and
+        // all there is to do.
+        if xvk.is_none() && hw == 0 {
+            let Some(taddr) = tk.address.clone() else {
+                anyhow::bail!(
+                    "This account has no transparent address to scan. Import \
+                     a transparent key (WIF or extended key) first."
+                );
+            };
+            progress_fn(taddr.clone());
+            tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    return Ok::<_, anyhow::Error>(n_added)
+                }
+                txids = client.taddress_txs(&network, &taddr, start_height, end_height) => {
+                    let mut txids = txids?;
+                    // Draining the stream is what makes the transactions of
+                    // this address land in the database.
+                    while txids.next().await.is_some() {}
+                }
+            }
+            return Ok::<_, anyhow::Error>(n_added);
+        }
+
         for scope in 0..2 {
             let mut dindex = 0;
             let mut gap = 0;
