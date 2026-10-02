@@ -17,16 +17,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            target: android
-          - os: ubuntu-latest
-            target: linux
-            arch: x86_64
-          - os: ubuntu-24.04-arm
-            target: linux
-            arch: aarch64
-          - os: macos-latest
-            target: mac
+          # SO WINDOWS. As outras plataformas estao comentadas de proposito:
+          # construir todas leva de 20 a 40 minutos e gasta cota de graca
+          # para gerar coisa que voce nao vai usar. Para voltar a construir
+          # alguma, basta apagar o "#" das linhas dela.
+          #
+          # - os: macos-latest
+          #   target: android
+          # - os: ubuntu-latest
+          #   target: linux
+          #   arch: x86_64
+          # - os: ubuntu-24.04-arm
+          #   target: linux
+          #   arch: aarch64
+          # - os: macos-latest
+          #   target: mac
           - os: windows-latest
             target: windows
     env:
